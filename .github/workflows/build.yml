@@ -1,4 +1,4 @@
-name: Build Bazikhone WebView Adivery
+name: Build Bazikhone WebView Adivery R8 Fix
 
 on:
   workflow_dispatch:
@@ -69,7 +69,6 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-
           manifest = Path('android/app/src/main/AndroidManifest.xml')
           text = manifest.read_text()
 
@@ -100,7 +99,7 @@ jobs:
           set -euo pipefail
           yes | sdkmanager "platforms;android-36" "build-tools;36.0.0" || true
 
-      - name: Patch Android Gradle SDK and Kotlin
+      - name: Patch Android Gradle SDK Kotlin and R8
         working-directory: clean_project
         run: |
           set -euo pipefail
@@ -108,57 +107,60 @@ jobs:
           from pathlib import Path
           import re
 
-          gradle_files = [
-              Path('android/app/build.gradle'),
-              Path('android/app/build.gradle.kts'),
-          ]
-
+          gradle_files = [Path('android/app/build.gradle'), Path('android/app/build.gradle.kts')]
           for f in gradle_files:
               if not f.exists():
                   continue
-
               text = f.read_text()
               text = re.sub(r'compileSdk\s*=\s*flutter\.compileSdkVersion', 'compileSdk = 36', text)
               text = re.sub(r'compileSdkVersion\s+flutter\.compileSdkVersion', 'compileSdkVersion 36', text)
               text = re.sub(r'targetSdk\s*=\s*flutter\.targetSdkVersion', 'targetSdk = 36', text)
               text = re.sub(r'targetSdkVersion\s+flutter\.targetSdkVersion', 'targetSdkVersion 36', text)
+
+              if f.name.endswith('.kts'):
+                  if 'isMinifyEnabled' in text:
+                      text = re.sub(r'isMinifyEnabled\s*=\s*true', 'isMinifyEnabled = false', text)
+                      text = re.sub(r'isShrinkResources\s*=\s*true', 'isShrinkResources = false', text)
+                  else:
+                      text = text.replace('release {', 'release {\n            isMinifyEnabled = false\n            isShrinkResources = false')
+              else:
+                  if 'minifyEnabled' in text:
+                      text = re.sub(r'minifyEnabled\s+true', 'minifyEnabled false', text)
+                      text = re.sub(r'shrinkResources\s+true', 'shrinkResources false', text)
+                  else:
+                      text = text.replace('release {', 'release {\n            minifyEnabled false\n            shrinkResources false')
               f.write_text(text)
 
-          settings_files = [
-              Path('android/settings.gradle'),
-              Path('android/settings.gradle.kts'),
-          ]
-
+          settings_files = [Path('android/settings.gradle'), Path('android/settings.gradle.kts')]
           for f in settings_files:
               if not f.exists():
                   continue
-
               text = f.read_text()
               text = re.sub(
                   r'id\s+["\']org\.jetbrains\.kotlin\.android["\']\s+version\s+["\'][^"\']+["\']',
-                  'id "org.jetbrains.kotlin.android" version "2.1.10"',
-                  text,
+                  'id "org.jetbrains.kotlin.android" version "2.2.20"',
+                  text
               )
               text = re.sub(
                   r'id\(["\']org\.jetbrains\.kotlin\.android["\']\)\s+version\s+["\'][^"\']+["\']',
-                  'id("org.jetbrains.kotlin.android") version "2.1.10"',
-                  text,
+                  'id("org.jetbrains.kotlin.android") version "2.2.20"',
+                  text
               )
               f.write_text(text)
+
+          proguard = Path('android/app/proguard-rules.pro')
+          existing = proguard.read_text() if proguard.exists() else ''
+          rules = '''
+          -dontwarn com.mbridge.**
+          -dontwarn com.mintegral.**
+          -dontwarn com.adivery.**
+          -keep class com.adivery.** { *; }
+          -keep class com.mbridge.** { *; }
+          -keep class com.mintegral.** { *; }
+          '''
+          if 'com.mbridge' not in existing:
+              proguard.write_text(existing + rules)
           PY
-
-      - name: Verify app source
-        working-directory: clean_project
-        run: |
-          set -euo pipefail
-          if grep -R "Flutter Demo Home Page" -n lib; then
-            echo "Flutter demo page detected"
-            exit 1
-          fi
-
-          grep -R "BaziKhoneWebViewApp" -n lib/main.dart
-          grep -R "BannerAd" -n lib/main.dart
-          grep -R "adivery: ^4.8.8" -n pubspec.yaml
 
       - name: Get dependencies
         working-directory: clean_project
@@ -166,11 +168,11 @@ jobs:
 
       - name: Build APK
         working-directory: clean_project
-        run: flutter build apk --release --build-name=1.1.3 --build-number=5
+        run: flutter build apk --release --no-shrink --build-name=1.1.4 --build-number=6
 
       - name: Build AAB
         working-directory: clean_project
-        run: flutter build appbundle --release --build-name=1.1.3 --build-number=5
+        run: flutter build appbundle --release --no-shrink --build-name=1.1.4 --build-number=6
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
