@@ -1,4 +1,4 @@
-name: Build Flutter WebView APK
+name: Build Bazikhone WebView Adivery
 
 on:
   workflow_dispatch:
@@ -13,21 +13,39 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find latest ZIP and unzip
-        run: |
-          ZIP_FILE=$(ls -t *.zip 2>/dev/null | head -n 1)
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      - name: Resolve source project
+        run: |
+          set -euo pipefail
+          rm -rf extracted clean_project
+
+          if [ -f "pubspec.yaml" ] && [ -d "lib" ]; then
+            echo "SOURCE_DIR=$PWD" >> "$GITHUB_ENV"
+            echo "Using repository root as Flutter source"
+            exit 0
+          fi
+
+          ZIP_FILE=$(ls -t *.zip 2>/dev/null | head -n 1 || true)
           if [ -z "$ZIP_FILE" ]; then
-            echo "No ZIP file found in repository root"
+            echo "No Flutter project or ZIP found"
             exit 1
           fi
 
           echo "Using ZIP: $ZIP_FILE"
-
-          rm -rf extracted clean_project
           mkdir extracted
           unzip -q "$ZIP_FILE" -d extracted
-
           SOURCE_DIR=$(find extracted -name "pubspec.yaml" -exec dirname {} \; | head -n 1)
 
           if [ -z "$SOURCE_DIR" ]; then
@@ -35,59 +53,78 @@ jobs:
             exit 1
           fi
 
-          echo "SOURCE_DIR=$SOURCE_DIR" >> $GITHUB_ENV
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: "3.24.5"
-          channel: stable
+          echo "SOURCE_DIR=$PWD/$SOURCE_DIR" >> "$GITHUB_ENV"
 
       - name: Create clean Flutter Android project
         run: |
+          set -euo pipefail
           flutter create -t app --platforms=android --project-name bazikhone_webview clean_project
 
-          rm -rf clean_project/lib
+          rm -rf clean_project/lib clean_project/assets clean_project/pubspec.yaml
           cp -r "$SOURCE_DIR/lib" clean_project/lib
-
           cp "$SOURCE_DIR/pubspec.yaml" clean_project/pubspec.yaml
+          cp -r "$SOURCE_DIR/assets" clean_project/assets
 
-          if [ -d "$SOURCE_DIR/assets" ]; then
-            rm -rf clean_project/assets
-            cp -r "$SOURCE_DIR/assets" clean_project/assets
+      - name: Patch Android manifest for ads
+        working-directory: clean_project
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          text = manifest.read_text()
+
+          permissions = [
+              '<uses-permission android:name="android.permission.INTERNET"/>',
+              '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>',
+              '<uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>',
+          ]
+          insert_at = text.find('<application')
+          for permission in permissions:
+              if permission not in text:
+                  text = text[:insert_at] + '    ' + permission + '\n' + text[insert_at:]
+                  insert_at = text.find('<application')
+
+          if 'com.adivery.sdk.APPLICATION_ID' not in text:
+              app_open = text.find('<application')
+              app_close = text.find('>', app_open) + 1
+              meta = '\n        <meta-data android:name="com.adivery.sdk.APPLICATION_ID" android:value="aa714944-d43d-43d4-9d36-1cb3404cefbc"/>'
+              text = text[:app_close] + meta + text[app_close:]
+
+          text = text.replace('android:label="bazikhone_webview"', 'android:label="بازی خونه"')
+          manifest.write_text(text)
+          PY
+
+      - name: Verify app source
+        working-directory: clean_project
+        run: |
+          set -euo pipefail
+          if grep -R "Flutter Demo Home Page" -n lib; then
+            echo "Flutter demo page detected"
+            exit 1
           fi
+          grep -R "BaziKhoneWebViewApp" -n lib/main.dart
 
-          if [ -d "$SOURCE_DIR/web_assets" ]; then
-            rm -rf clean_project/web_assets
-            cp -r "$SOURCE_DIR/web_assets" clean_project/web_assets
-          fi
-
-      - name: Flutter pub get
+      - name: Get dependencies
         working-directory: clean_project
         run: flutter pub get
 
       - name: Build APK
         working-directory: clean_project
-        run: flutter build apk --release
+        run: flutter build apk --release --build-name=1.1.0 --build-number=2
 
       - name: Build AAB
         working-directory: clean_project
-        run: flutter build appbundle --release
+        run: flutter build appbundle --release --build-name=1.1.0 --build-number=2
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: bazikhone-webview-apk
+          name: bazikhone-webview-adivery-apk
           path: clean_project/build/app/outputs/flutter-apk/app-release.apk
 
       - name: Upload AAB
         uses: actions/upload-artifact@v4
         with:
-          name: bazikhone-webview-aab
+          name: bazikhone-webview-adivery-aab
           path: clean_project/build/app/outputs/bundle/release/app-release.aab
