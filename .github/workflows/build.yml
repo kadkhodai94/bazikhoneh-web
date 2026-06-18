@@ -1,4 +1,4 @@
-name: Build Flutter APK from ZIP
+name: Build Flutter WebView APK
 
 on:
   workflow_dispatch:
@@ -13,27 +13,29 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find and unzip project ZIP
+      - name: Find latest ZIP and unzip
         run: |
-          ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
-          echo "ZIP file: $ZIP_FILE"
+          ZIP_FILE=$(ls -t *.zip 2>/dev/null | head -n 1)
 
           if [ -z "$ZIP_FILE" ]; then
             echo "No ZIP file found in repository root"
             exit 1
           fi
 
+          echo "Using ZIP: $ZIP_FILE"
+
+          rm -rf extracted clean_project
           mkdir extracted
           unzip -q "$ZIP_FILE" -d extracted
 
-          PROJECT_DIR=$(find extracted -name "pubspec.yaml" -exec dirname {} \; | head -n 1)
+          SOURCE_DIR=$(find extracted -name "pubspec.yaml" -exec dirname {} \; | head -n 1)
 
-          if [ -z "$PROJECT_DIR" ]; then
+          if [ -z "$SOURCE_DIR" ]; then
             echo "pubspec.yaml not found after unzip"
             exit 1
           fi
 
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          echo "SOURCE_DIR=$SOURCE_DIR" >> $GITHUB_ENV
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -47,26 +49,45 @@ jobs:
           flutter-version: "3.24.5"
           channel: stable
 
+      - name: Create clean Flutter Android project
+        run: |
+          flutter create -t app --platforms=android --project-name bazikhone_webview clean_project
+
+          rm -rf clean_project/lib
+          cp -r "$SOURCE_DIR/lib" clean_project/lib
+
+          cp "$SOURCE_DIR/pubspec.yaml" clean_project/pubspec.yaml
+
+          if [ -d "$SOURCE_DIR/assets" ]; then
+            rm -rf clean_project/assets
+            cp -r "$SOURCE_DIR/assets" clean_project/assets
+          fi
+
+          if [ -d "$SOURCE_DIR/web_assets" ]; then
+            rm -rf clean_project/web_assets
+            cp -r "$SOURCE_DIR/web_assets" clean_project/web_assets
+          fi
+
       - name: Flutter pub get
-        working-directory: ${{ env.PROJECT_DIR }}
+        working-directory: clean_project
         run: flutter pub get
 
       - name: Build APK
-        working-directory: ${{ env.PROJECT_DIR }}
+        working-directory: clean_project
         run: flutter build apk --release
 
       - name: Build AAB
-        working-directory: ${{ env.PROJECT_DIR }}
+        working-directory: clean_project
         run: flutter build appbundle --release
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: bazikhone-webview-apk
-          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+          path: clean_project/build/app/outputs/flutter-apk/app-release.apk
 
       - name: Upload AAB
         uses: actions/upload-artifact@v4
         with:
           name: bazikhone-webview-aab
-          path: ${{ env.PROJECT_DIR }}/build/app/outputs/bundle/release/app-release.aab
+          path: clean_project/build/app/outputs/bundle/release/app-release.aab
