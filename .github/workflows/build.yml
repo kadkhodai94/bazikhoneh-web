@@ -1,13 +1,9 @@
-name: Build Flutter From ZIP
+name: Build Bazikhone WebView Adivery
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main, master ]
-  workflow_dispatch:
-
-env:
-  VERSION_NAME: 1.1.4
-  VERSION_CODE: 6
 
 jobs:
   build:
@@ -17,128 +13,195 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: Resolve ZIP
+        run: |
+          set -euo pipefail
+          rm -rf extracted clean_project
+
+          ZIP_FILE=$(ls -t *.zip 2>/dev/null | head -n 1 || true)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No ZIP file found in repository root"
+            exit 1
+          fi
+
+          echo "Using ZIP: $ZIP_FILE"
+          mkdir extracted
+          unzip -q "$ZIP_FILE" -d extracted
+
+          SOURCE_DIR=$(find extracted -name "pubspec.yaml" -exec dirname {} \; | head -n 1)
+
+          if [ -z "$SOURCE_DIR" ]; then
+            echo "pubspec.yaml not found after unzip"
+            exit 1
+          fi
+
+          if [ ! -f "$SOURCE_DIR/lib/main.dart" ]; then
+            echo "lib/main.dart not found"
+            exit 1
+          fi
+
+          echo "SOURCE_DIR=$PWD/$SOURCE_DIR" >> "$GITHUB_ENV"
+
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.24.5"
           channel: stable
           cache: true
 
-      - name: Find and unzip project
-        shell: bash
+      - name: Create clean Flutter Android project
         run: |
-          set -e
+          set -euo pipefail
 
-          echo "Files in repository:"
-          ls -la
+          flutter create -t app --platforms=android --project-name bazikhone_webview clean_project
 
-          ZIP_FILE=$(find . -maxdepth 2 -type f -name "*.zip" | head -n 1 || true)
+          rm -rf clean_project/lib
+          rm -rf clean_project/assets
+          rm -f clean_project/pubspec.yaml
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No ZIP file found in repository."
-            exit 1
-          fi
+          cp -r "$SOURCE_DIR/lib" clean_project/lib
+          cp "$SOURCE_DIR/pubspec.yaml" clean_project/pubspec.yaml
+          cp -r "$SOURCE_DIR/assets" clean_project/assets
 
-          echo "ZIP found: $ZIP_FILE"
-
-          rm -rf extracted_project
-          mkdir -p extracted_project
-          unzip -o "$ZIP_FILE" -d extracted_project
-
-          PUBSPEC_PATH=$(find extracted_project -type f -name "pubspec.yaml" | head -n 1 || true)
-
-          if [ -z "$PUBSPEC_PATH" ]; then
-            echo "ERROR: pubspec.yaml not found inside ZIP."
-            exit 1
-          fi
-
-          PROJECT_DIR=$(dirname "$PUBSPEC_PATH")
-
-          echo "Flutter project found at: $PROJECT_DIR"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
-
-      - name: Disable Flutter analytics
-        run: flutter config --no-analytics
-
-      - name: Create Android folder if missing
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Patch Android manifest
+        working-directory: clean_project
         run: |
-          if [ ! -d "android" ]; then
-            flutter create . \
-              --platforms=android \
-              --project-name=bazikhone_native \
-              --org=com.lalenawid \
-              --no-overwrite
-          else
-            echo "Android folder already exists."
-          fi
+          set -euo pipefail
 
-      - name: Patch Adivery nullable bool error
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
+          python3 - <<'PY'
+          from pathlib import Path
+
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          text = manifest.read_text()
+
+          permissions = [
+              '<uses-permission android:name="android.permission.INTERNET"/>',
+              '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>',
+              '<uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>',
+          ]
+
+          insert_at = text.find('<application')
+          for permission in permissions:
+              if permission not in text:
+                  text = text[:insert_at] + '    ' + permission + '\n' + text[insert_at:]
+                  insert_at = text.find('<application')
+
+          if 'com.adivery.sdk.APPLICATION_ID' not in text:
+              app_open = text.find('<application')
+              app_close = text.find('>', app_open) + 1
+              meta = '\n        <meta-data android:name="com.adivery.sdk.APPLICATION_ID" android:value="aa714944-d43d-43d4-9d36-1cb3404cefbc"/>'
+              text = text[:app_close] + meta + text[app_close:]
+
+          text = text.replace('android:label="bazikhone_webview"', 'android:label="بازی خونه"')
+          manifest.write_text(text)
+          PY
+
+      - name: Install Android SDK 36
         run: |
-          set -e
+          set -euo pipefail
+          yes | sdkmanager "platforms;android-36" "build-tools;36.0.0" || true
 
-          python3 <<'PY'
+      - name: Patch Gradle SDK Kotlin R8
+        working-directory: clean_project
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
           from pathlib import Path
           import re
 
-          lib_dir = Path("lib")
-          if not lib_dir.exists():
-              print("No lib directory found. Skipping Dart patch.")
-              raise SystemExit(0)
+          gradle_files = [
+              Path('android/app/build.gradle'),
+              Path('android/app/build.gradle.kts'),
+          ]
 
-          changed_files = []
+          for f in gradle_files:
+              if not f.exists():
+                  continue
 
-          pattern = re.compile(
-              r'(\b[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*)await\s+AdiveryPlugin\.isLoaded\(([^;\n]+)\);'
-          )
+              text = f.read_text()
 
-          for path in lib_dir.rglob("*.dart"):
-              text = path.read_text(encoding="utf-8")
-              new_text = pattern.sub(
-                  r'\1(await AdiveryPlugin.isLoaded(\2)) ?? false;',
-                  text
+              text = re.sub(r'compileSdk\s*=\s*flutter\.compileSdkVersion', 'compileSdk = 36', text)
+              text = re.sub(r'compileSdkVersion\s+flutter\.compileSdkVersion', 'compileSdkVersion 36', text)
+              text = re.sub(r'targetSdk\s*=\s*flutter\.targetSdkVersion', 'targetSdk = 36', text)
+              text = re.sub(r'targetSdkVersion\s+flutter\.targetSdkVersion', 'targetSdkVersion 36', text)
+
+              if f.name.endswith('.kts'):
+                  text = re.sub(r'isMinifyEnabled\s*=\s*true', 'isMinifyEnabled = false', text)
+                  text = re.sub(r'isShrinkResources\s*=\s*true', 'isShrinkResources = false', text)
+              else:
+                  text = re.sub(r'minifyEnabled\s+true', 'minifyEnabled false', text)
+                  text = re.sub(r'shrinkResources\s+true', 'shrinkResources false', text)
+
+              f.write_text(text)
+
+          settings_files = [
+              Path('android/settings.gradle'),
+              Path('android/settings.gradle.kts'),
+          ]
+
+          for f in settings_files:
+              if not f.exists():
+                  continue
+
+              text = f.read_text()
+
+              text = re.sub(
+                  r'id\s+["\']org\.jetbrains\.kotlin\.android["\']\s+version\s+["\'][^"\']+["\']',
+                  'id "org.jetbrains.kotlin.android" version "2.2.20"',
+                  text,
               )
 
-              if new_text != text:
-                  path.write_text(new_text, encoding="utf-8")
-                  changed_files.append(str(path))
+              text = re.sub(
+                  r'id\(["\']org\.jetbrains\.kotlin\.android["\']\)\s+version\s+["\'][^"\']+["\']',
+                  'id("org.jetbrains.kotlin.android") version "2.2.20"',
+                  text,
+              )
 
-          if changed_files:
-              print("Patched Adivery nullable bool in:")
-              for item in changed_files:
-                  print("-", item)
-          else:
-              print("No Adivery nullable bool assignment found or already patched.")
+              f.write_text(text)
+
+          proguard = Path('android/app/proguard-rules.pro')
+          existing = proguard.read_text() if proguard.exists() else ''
+
+          rules = (
+              "\n-dontwarn com.mbridge.**\n"
+              "-dontwarn com.mintegral.**\n"
+              "-dontwarn com.adivery.**\n"
+              "-keep class com.adivery.** { *; }\n"
+              "-keep class com.mbridge.** { *; }\n"
+              "-keep class com.mintegral.** { *; }\n"
+          )
+
+          if 'com.mbridge' not in existing:
+              proguard.write_text(existing + rules)
           PY
 
-      - name: Flutter pub get
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Get packages
+        working-directory: clean_project
         run: flutter pub get
 
-      - name: Build release APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter build apk --release --no-shrink --build-name=${{ env.VERSION_NAME }} --build-number=${{ env.VERSION_CODE }}
+      - name: Build APK
+        working-directory: clean_project
+        run: flutter build apk --release --no-shrink --build-name=1.1.8 --build-number=10
 
-      - name: Build release AAB
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter build appbundle --release --build-name=${{ env.VERSION_NAME }} --build-number=${{ env.VERSION_CODE }}
+      - name: Build AAB
+        working-directory: clean_project
+        run: flutter build appbundle --release --no-shrink --build-name=1.1.8 --build-number=10
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: bazikhone-native-v${{ env.VERSION_NAME }}-apk
-          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+          name: bazikhone-apk
+          path: clean_project/build/app/outputs/flutter-apk/app-release.apk
 
-      - name: Upload AAB artifact
+      - name: Upload AAB
         uses: actions/upload-artifact@v4
         with:
-          name: bazikhone-native-v${{ env.VERSION_NAME }}-aab
-          path: ${{ env.PROJECT_DIR }}/build/app/outputs/bundle/release/app-release.aab
+          name: bazikhone-aab
+          path: clean_project/build/app/outputs/bundle/release/app-release.aab
